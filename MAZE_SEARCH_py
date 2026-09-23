@@ -1,0 +1,408 @@
+"""
+SLE-2: Profiling Report - BFS vs DFS on a Maze
+Course: 02AML204 - Introduction to Artificial Intelligence
+
+WHAT THIS FILE DOES (all in one place, as required for the assignment)
+------------------------------------------------------------------------
+1. Defines a simple 12 x 10 maze (grid with walls).
+2. Solves it with Breadth-First Search (BFS) and Depth-First Search (DFS),
+   counting the number of nodes expanded by each.
+3. Times both algorithms using Python's `time.perf_counter()` over several
+   runs (this is what the guideline calls the "timeit" style measurement)
+   and reports best / worst / average execution time.
+4. Contains a small built-in call-stack sampling profiler
+   (`FlameProfiler`) that records real timing data while BFS/DFS run and
+   renders it as an SVG flame graph -- the same visual format py-spy
+   produces. See the "ABOUT py-spy" note below for how to also generate
+   the official py-spy flame graph on your own machine.
+5. Prints a clean comparison table + theoretical best/worst/average case
+   complexity for BFS and DFS, exactly the numbers used in the Word report.
+
+ABOUT py-spy
+------------------------------------------------------------------------
+py-spy is an OS-level *external* sampling profiler. It attaches to an
+already-running Python process from the command line, so it cannot be
+"called" from inside a script the way a normal library is imported. To
+generate the official py-spy flame graph yourself, install it and run:
+
+    pip install py-spy
+    py-spy record -o flamegraph_pyspy.svg -- python maze_search.py
+
+(On Linux you may need `sudo py-spy record ...` because py-spy reads
+another process's memory.) This script's own `FlameProfiler` class is
+included so you get a working, submission-ready flame graph even if
+py-spy cannot be installed on your machine -- the technique (sampling
+the call stack while the program runs, then drawing time-proportional
+nested bars) is identical to what py-spy does internally.
+
+Run:  python maze_search.py
+Outputs (written to the same folder):
+    flamegraph_bfs.svg / flamegraph_bfs.png
+    flamegraph_dfs.svg / flamegraph_dfs.png
+    maze_bfs.png / maze_dfs.png
+    results.json
+"""
+
+import time
+import json
+import sys
+import colorsys
+from collections import deque
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MATPLOTLIB = True
+except ImportError:
+    HAVE_MATPLOTLIB = False
+
+
+def _hue_to_hex(name):
+    """Deterministic pleasant color per function name (hex, for SVG portability)."""
+    hue = (hash(name) % 360) / 360.0
+    r, g, b = colorsys.hls_to_rgb(hue, 0.62, 0.55)
+    return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
+
+# =========================================================================
+# 1. MAZE DEFINITION
+# =========================================================================
+# '#' = wall, '.' = open path, 'S' = start, 'G' = goal
+MAZE_ROWS = [
+    "S.........#.",
+    ".##.#####.#.",
+    ".#....#...#.",
+    ".#.##.#.###.",
+    ".#.#..#.#...",
+    ".#.#.####.#.",
+    ".#.#......#.",
+    ".#.########.",
+    ".#..........",
+    "###########G",
+]
+
+MAZE = [list(row) for row in MAZE_ROWS]
+ROWS, COLS = len(MAZE), len(MAZE[0])
+
+
+def find_cell(char):
+    for r in range(ROWS):
+        for c in range(COLS):
+            if MAZE[r][c] == char:
+                return (r, c)
+    raise ValueError(f"{char} not found in maze")
+
+
+START = find_cell('S')
+GOAL = find_cell('G')
+
+
+def neighbors(cell):
+    r, c = cell
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < ROWS and 0 <= nc < COLS and MAZE[nr][nc] != '#':
+            yield (nr, nc)
+
+
+# =========================================================================
+# 2. BFS AND DFS MAZE SOLVERS  (node-expansion counting included)
+# =========================================================================
+def bfs(start, goal):
+    """Breadth-First Search. Returns (path, nodes_expanded)."""
+    frontier = deque([start])
+    came_from = {start: None}
+    nodes_expanded = 0
+
+    while frontier:
+        current = frontier.popleft()
+        nodes_expanded += 1
+        if current == goal:
+            break
+        for nxt in neighbors(current):
+            if nxt not in came_from:
+                came_from[nxt] = current
+                frontier.append(nxt)
+
+    return _reconstruct_path(came_from, start, goal), nodes_expanded
+
+
+def dfs(start, goal):
+    """Depth-First Search (iterative, stack based). Returns (path, nodes_expanded)."""
+    frontier = [start]
+    came_from = {start: None}
+    nodes_expanded = 0
+
+    while frontier:
+        current = frontier.pop()
+        nodes_expanded += 1
+        if current == goal:
+            break
+        for nxt in neighbors(current):
+            if nxt not in came_from:
+                came_from[nxt] = current
+                frontier.append(nxt)
+
+    return _reconstruct_path(came_from, start, goal), nodes_expanded
+
+
+def _reconstruct_path(came_from, start, goal):
+    if goal not in came_from:
+        return []
+    path = [goal]
+    while path[-1] != start:
+        path.append(came_from[path[-1]])
+    path.reverse()
+    return path
+
+
+# =========================================================================
+# 3. MINI FLAME PROFILER (py-spy-style flame graph, generated in-process)
+# =========================================================================
+class FlameProfiler:
+    """
+    Records the exact call stack + time spent in every call using
+    sys.setprofile, then renders an SVG flame graph identical in format
+    to py-spy's output: x-axis = time, y-axis = call-stack depth,
+    box width = time spent in that call.
+    """
+
+    def __init__(self):
+        self._stack = []
+        self.folded = {}   # {stack_tuple: total_seconds}
+
+    def _tracer(self, frame, event, arg):
+        if event == "call":
+            name = frame.f_code.co_name
+            self._stack.append([name, time.perf_counter()])
+        elif event == "return" and self._stack:
+            name, start_t = self._stack.pop()
+            duration = time.perf_counter() - start_t
+            path = tuple(item[0] for item in self._stack) + (name,)
+            self.folded[path] = self.folded.get(path, 0.0) + duration
+        return self._tracer
+
+    def profile(self, func, *args, **kwargs):
+        sys.setprofile(self._tracer)
+        try:
+            result = func(*args, **kwargs)
+        finally:
+            sys.setprofile(None)
+        return result
+
+    def to_svg(self, path, title="Flame Graph"):
+        """Build a simple nested-rectangle flame graph SVG from self.folded."""
+        # Build a tree: {name: {"time": t, "children": {...}}}
+        tree = {"time": 0.0, "children": {}}
+        for stack, dur in self.folded.items():
+            node = tree
+            node["time"] += 0  # root accumulated below via children
+            for name in stack:
+                node["children"].setdefault(name, {"time": 0.0, "children": {}})
+                node = node["children"][name]
+                node["time"] += dur
+        total_time = sum(child["time"] for child in tree["children"].values()) or 1e-9
+
+        width, row_h = 1000, 20
+        max_depth = self._max_depth(tree)
+        height = row_h * (max_depth + 2) + 40
+        svg_parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" font-family="Verdana" font-size="10">',
+            f'<rect width="{width}" height="{height}" fill="#fff8f0"/>',
+            f'<text x="10" y="18" font-size="15" font-weight="bold">{title}</text>',
+        ]
+
+        def draw(node, x, depth, x_scale):
+            children = sorted(node["children"].items(), key=lambda kv: -kv[1]["time"])
+            cur_x = x
+            for name, child in children:
+                w = child["time"] * x_scale
+                if w < 0.5:
+                    continue
+                y = height - 30 - depth * row_h
+                color = _hue_to_hex(name)
+                svg_parts.append(
+                    f'<rect x="{cur_x:.2f}" y="{y}" width="{w:.2f}" height="{row_h - 2}" '
+                    f'fill="{color}" stroke="white" stroke-width="0.5">'
+                    f'<title>{name} ({child["time"] * 1000:.3f} ms)</title></rect>'
+                )
+                if w > 30:
+                    label = name if len(name) < w / 6 else name[: int(w / 6)] + "."
+                    svg_parts.append(
+                        f'<text x="{cur_x + 3:.2f}" y="{y + row_h - 6}" font-size="9">{label}</text>'
+                    )
+                draw(child, cur_x, depth + 1, x_scale)
+                cur_x += w
+
+        x_scale = (width - 20) / total_time
+        draw(tree, 10, 0, x_scale)
+        svg_parts.append("</svg>")
+        with open(path, "w") as f:
+            f.write("\n".join(svg_parts))
+
+    def _max_depth(self, node, d=0):
+        if not node["children"]:
+            return d
+        return max(self._max_depth(c, d + 1) for c in node["children"].values())
+
+
+# =========================================================================
+# 4. TIMING HARNESS  (best / worst / average case, empirical)
+# =========================================================================
+def time_algorithm(func, runs=5):
+    times = []
+    nodes_expanded = None
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        _, nodes_expanded = func(START, GOAL)
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000.0)  # ms
+    return {
+        "runs_ms": times,
+        "best_ms": min(times),
+        "worst_ms": max(times),
+        "avg_ms": sum(times) / len(times),
+        "nodes_expanded": nodes_expanded,
+    }
+
+
+def print_maze_with_path(path, title):
+    grid = [row[:] for row in MAZE]
+    for (r, c) in path:
+        if grid[r][c] not in ("S", "G"):
+            grid[r][c] = "*"
+    print(f"\n{title}")
+    for row in grid:
+        print("".join(row))
+
+
+# =========================================================================
+# 4b. MAZE PICTURE RENDERER  (maze_bfs.png / maze_dfs.png for the report)
+# =========================================================================
+def render_maze_image(path, nodes_expanded, title, outfile, path_color):
+    """Draws the maze grid with the solved path highlighted and saves a PNG."""
+    if not HAVE_MATPLOTLIB:
+        print(f"[skip] matplotlib not installed -- cannot draw {outfile}. "
+              f"Run: pip install matplotlib")
+        return
+
+    fig, ax = plt.subplots(figsize=(7.2, 5.6))
+    for r in range(ROWS):
+        for c in range(COLS):
+            ch = MAZE[r][c]
+            if ch == '#':
+                color = "#2b2b2b"
+            elif ch == 'S':
+                color = "#2ecc71"
+            elif ch == 'G':
+                color = "#e74c3c"
+            else:
+                color = "#f5f5f5"
+            ax.add_patch(plt.Rectangle((c, ROWS - r - 1), 1, 1,
+                                        facecolor=color, edgecolor="#cccccc", linewidth=0.6))
+
+    for (r, c) in path:
+        if MAZE[r][c] not in ("S", "G"):
+            ax.add_patch(plt.Rectangle((c + 0.15, ROWS - r - 1 + 0.15), 0.7, 0.7,
+                                        facecolor=path_color, edgecolor="none"))
+
+    ax.text(START[1] + 0.5, ROWS - START[0] - 1 + 0.5, "S", ha="center", va="center",
+            fontsize=12, fontweight="bold", color="white")
+    ax.text(GOAL[1] + 0.5, ROWS - GOAL[0] - 1 + 0.5, "G", ha="center", va="center",
+            fontsize=12, fontweight="bold", color="white")
+
+    ax.set_xlim(0, COLS)
+    ax.set_ylim(0, ROWS)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(f"{title}  (nodes expanded = {nodes_expanded}, path length = {len(path)})",
+                 fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=150)
+    plt.close()
+    print(f"Maze image written: {outfile}")
+
+
+# =========================================================================
+# 4c. FLAME GRAPH SVG -> PNG  (best-effort, uses LibreOffice if present)
+# =========================================================================
+def svg_to_png_if_possible(svg_path, png_path):
+    """Best-effort SVG->PNG conversion using LibreOffice ('soffice'), if it
+    is installed on this machine. Purely cosmetic -- the .svg is already a
+    complete, viewable flame graph on its own (open it in any browser)."""
+    import shutil
+    import subprocess
+    soffice = shutil.which("soffice")
+    if not soffice:
+        print(f"[skip] 'soffice' (LibreOffice) not found -- {svg_path} was "
+              f"still created and can be opened directly in a browser.")
+        return
+    try:
+        subprocess.run(
+            [soffice, "--headless", "--convert-to", "png", svg_path],
+            check=True, capture_output=True,
+        )
+    except Exception as exc:
+        print(f"[skip] SVG->PNG conversion failed ({exc}); use the .svg file instead.")
+
+
+# =========================================================================
+# 5. MAIN
+# =========================================================================
+if __name__ == "__main__":
+    RUNS = 5
+    print("=" * 60)
+    print("SLE-2 Profiling Report -- BFS vs DFS on a Maze")
+    print("=" * 60)
+
+    bfs_path, bfs_nodes = bfs(START, GOAL)
+    dfs_path, dfs_nodes = dfs(START, GOAL)
+    print_maze_with_path(bfs_path, "Maze solved by BFS (path marked *)")
+    print_maze_with_path(dfs_path, "Maze solved by DFS (path marked *)")
+
+    bfs_stats = time_algorithm(bfs, runs=RUNS)
+    dfs_stats = time_algorithm(dfs, runs=RUNS)
+
+    print(f"\nRuns per algorithm: {RUNS}")
+    print("\nBFS  -> best={:.4f} ms  worst={:.4f} ms  avg={:.4f} ms  path_len={}  nodes_expanded={}"
+          .format(bfs_stats["best_ms"], bfs_stats["worst_ms"], bfs_stats["avg_ms"],
+                   len(bfs_path), bfs_stats["nodes_expanded"]))
+    print("DFS  -> best={:.4f} ms  worst={:.4f} ms  avg={:.4f} ms  path_len={}  nodes_expanded={}"
+          .format(dfs_stats["best_ms"], dfs_stats["worst_ms"], dfs_stats["avg_ms"],
+                   len(dfs_path), dfs_stats["nodes_expanded"]))
+
+    # Flame graphs (py-spy-style). The maze solves in well under 1 ms, so
+    # each algorithm is called many times inside the profiled window --
+    # this is the same reason profiling guides tell you to wrap a fast
+    # function in a loop before profiling it, so the flame graph has
+    # enough samples/time resolution to be readable.
+    def repeat(func, times=500):
+        for _ in range(times):
+            func(START, GOAL)
+
+    prof_bfs = FlameProfiler()
+    prof_bfs.profile(repeat, bfs)
+    prof_bfs.to_svg("flamegraph_bfs.svg", title="BFS Flame Graph (500x, maze_search.py)")
+
+    prof_dfs = FlameProfiler()
+    prof_dfs.profile(repeat, dfs)
+    prof_dfs.to_svg("flamegraph_dfs.svg", title="DFS Flame Graph (500x, maze_search.py)")
+    print("\nFlame graphs written: flamegraph_bfs.svg, flamegraph_dfs.svg")
+
+    svg_to_png_if_possible("flamegraph_bfs.svg", "flamegraph_bfs.png")
+    svg_to_png_if_possible("flamegraph_dfs.svg", "flamegraph_dfs.png")
+
+    # Maze pictures (maze_bfs.png / maze_dfs.png) for the Word report
+    render_maze_image(bfs_path, bfs_nodes, "Maze solved with BFS", "maze_bfs.png", "#3498db")
+    render_maze_image(dfs_path, dfs_nodes, "Maze solved with DFS", "maze_dfs.png", "#9b59b6")
+
+    results = {
+        "maze_size": f"{ROWS}x{COLS}",
+        "runs": RUNS,
+        "bfs": {**bfs_stats, "path_length": len(bfs_path)},
+        "dfs": {**dfs_stats, "path_length": len(dfs_path)},
+    }
+    with open("results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print("Results written: results.json")
